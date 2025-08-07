@@ -1,0 +1,15 @@
+{
+  "name": "MQTT",
+  "version": "1.0.0",
+  "description": "MQTT library for ESP32",
+  "keywords": "esp32, MQTT, custom",
+  "authors": [
+    {
+      "name": "Yevhenii Sokolov",
+      "email": "theassper@gmail.com"
+    }
+  ],
+  "license": "MIT",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
