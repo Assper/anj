@@ -4,68 +4,43 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ArduinoJson.h>
+#include <esp_mac.h> // Явно подключим для esp_read_mac
 #include "../../shared/auth.hpp"
 
-// Web server for configuration
+// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 WebServer server(80);
 DNSServer dnsServer;
-const char* ap_ssid = "ESP32-Config";
-const char* ap_password = "12345678";
+const char* ap_password = "12345678"; // Пароль к точке доступа
+String deviceName = ""; // Будем хранить уникальное имя устройства здесь
 
-// Your existing instances
-Auth auth("", ""); // Start with empty credentials
+// --- Экземпляры твоих классов ---
+Auth auth("", ""); 
 MQTT mqtt;
 bool wifiCredentialsUpdated = false;
 bool configMode = true;
 
-// Function declarations
+// --- ОБЪЯВЛЕНИЕ ФУНКЦИЙ ---
 void startAPMode();
 void connectToWiFi();
-void handleRoot();
-void handleSave();
+void handleCaptivePortal(); // ИЗМЕНЕНО: Новая функция для редиректа
 void handleStatus();
 void handleMQTT();
+// handleRoot и handleSave удалены
 
-const char* config_html = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ESP32 WiFi Config</title>
-    <style>
-        body { font-family: Arial; margin: 40px; background: #f0f0f0; }
-        .container { max-width: 400px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; }
-        input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-        button { width: 100%; padding: 12px; background: #007cba; color: white; border: none; border-radius: 5px; cursor: pointer; }
-        button:hover { background: #005a8b; }
-        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
-        .success { background: #d4edda; color: #155724; }
-        .error { background: #f8d7da; color: #721c24; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>ESP32 WiFi Configuration</h2>
-        <form action="/save" method="POST">
-            <label>WiFi Network Name (SSID):</label>
-            <input type="text" name="ssid" placeholder="Enter WiFi name" required>
+// --- РЕАЛИЗАЦИЯ ФУНКЦИЙ ---
 
-            <label>WiFi Password:</label>
-            <input type="password" name="password" placeholder="Enter WiFi password">
-
-            <button type="submit">Connect to WiFi</button>
-        </form>
-        <p style="color: #666; font-size: 12px;">
-            After connecting, the ESP32 will join your WiFi network and start normal operation.
-        </p>
-    </div>
-</body>
-</html>
-)";
+// Генерирует уникальное имя на основе MAC-адреса
+String generateDeviceName() {
+    uint8_t mac[6];
+    char macStr[18] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(macStr, sizeof(macStr), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+    return "Hub-Device-" + String(macStr);
+}
 
 void connectToWiFi() {
     Serial.println("[MAIN] Attempting WiFi connection...");
 
-    // Stop AP mode components
     if (configMode) {
         server.stop();
         dnsServer.stop();
@@ -73,17 +48,13 @@ void connectToWiFi() {
         delay(1000);
     }
 
-    // Try to connect
     auth.connect_wifi();
 
     if (auth.is_connected()) {
         Serial.println("[MAIN] WiFi connected! Starting normal operation...");
         configMode = false;
-
-        // Setup MQTT
         mqtt.setAuthInstance(&auth);
         mqtt.connect();
-
     } else {
         Serial.println("[MAIN] WiFi connection failed. Returning to AP mode...");
         delay(2000);
@@ -91,27 +62,40 @@ void connectToWiFi() {
     }
 }
 
+// ⭐️ ИЗМЕНЕНО: Эта функция теперь отвечает за редирект в приложение
+void handleCaptivePortal() {
+    // Формируем специальную ссылку (deep link) для твоего приложения
+    String redirectUrl = "anj-iot://configure?device_name=" + deviceName;
+    
+    // Отправляем HTTP-ответ 302, который говорит браузеру перейти по новой ссылке
+    server.sendHeader("Location", redirectUrl, true);
+    server.send(302, "text/plain", ""); // Тело ответа может быть пустым
+    Serial.println("[WEB] Captive Portal: Redirecting to mobile app via " + redirectUrl);
+}
+
+
 void startAPMode() {
     Serial.println("[WEB] Starting Access Point mode...");
+    
+    // ⭐️ ИЗМЕНЕНО: Генерируем имя один раз и сохраняем в глобальную переменную
+    deviceName = generateDeviceName();
 
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(ap_ssid, ap_password);
+    WiFi.softAP(deviceName.c_str(), ap_password); // Используем .c_str() для String
 
     Serial.println("[WEB] Access Point started:");
-    Serial.println("Network: " + String(ap_ssid));
+    Serial.println("Network: " + deviceName);
     Serial.println("Password: " + String(ap_password));
     Serial.println("IP: " + WiFi.softAPIP().toString());
-    Serial.println("Open your browser and go to: http://" + WiFi.softAPIP().toString());
-
-    // Start DNS server for captive portal
+    
     dnsServer.start(53, "*", WiFi.softAPIP());
 
-    // Setup web server routes
-    server.on("/", handleRoot);
-    server.on("/save", HTTP_POST, handleSave);
-    server.on("/status", handleStatus);
-    server.on("/mqtt", HTTP_POST, handleMQTT);
-    server.onNotFound(handleRoot); // Redirect any request to config page
+    // ⭐️ ИЗМЕНЕНО: Настраиваем сервер на редирект
+    server.on("/", handleCaptivePortal);            // При заходе на главную страницу
+    server.on("/status", handleStatus);             // Оставим для отладки
+    server.on("/mqtt", HTTP_POST, handleMQTT);      // Оставим для отладки
+    server.onNotFound(handleCaptivePortal);         // Для всех остальных запросов (это ключ к работе Captive Portal)
+    // server.on("/save", ...) удален
 
     server.begin();
     Serial.println("[WEB] Web server started");
@@ -119,38 +103,8 @@ void startAPMode() {
     configMode = true;
 }
 
-void handleRoot() {
-    server.send(200, "text/html", config_html);
-}
-
-void handleSave() {
-    if (server.hasArg("ssid")) {
-        String ssid = server.arg("ssid");
-        String password = server.hasArg("password") ? server.arg("password") : "";
-
-        Serial.println("[WEB] New WiFi credentials received:");
-        Serial.println("SSID: " + ssid);
-        Serial.println("Password: [HIDDEN]");
-
-        server.send(200, "text/html",
-            "<html><body style='font-family:Arial;margin:40px;background:#f0f0f0;'>"
-            "<div style='max-width:400px;margin:0 auto;background:white;padding:30px;border-radius:10px;text-align:center;'>"
-            "<h2>Connecting to WiFi...</h2>"
-            "<p>ESP32 is now trying to connect to your WiFi network.</p>"
-            "<p>This may take up to 30 seconds.</p>"
-            "<p style='color:#666;font-size:12px;'>Check the serial monitor for connection status.</p>"
-            "</div></body></html>");
-
-        // Set new credentials
-        auth.setCredentials(ssid, password);
-
-        // Try to connect
-        delay(2000);
-        connectToWiFi();
-    } else {
-        server.send(400, "text/html", "Missing SSID parameter");
-    }
-}
+// ⭐️ УДАЛЕНО: handleRoot() и config_html больше не нужны
+// ⭐️ УДАЛЕНО: handleSave() больше не нужен
 
 void handleStatus() {
     DynamicJsonDocument doc(256);
@@ -168,19 +122,11 @@ void handleMQTT() {
         server.send(400, "text/plain", "Body not received");
         return;
     }
-
-    String message = "Message received";
     String body = server.arg("plain");
-    server.send(200, "text/plain", message);
-
+    server.send(200, "text/plain", "Message received");
+    
     DynamicJsonDocument doc(256);
-    DeserializationError error = deserializeJson(doc, body);
-
-    if (error) {
-        Serial.print(F("deserializeJson() failed: "));
-        Serial.println(error.f_str());
-        return;
-    }
+    if (deserializeJson(doc, body)) return;
 
     String topic = doc["topic"];
     String mqttMessage = doc["message"];
@@ -190,60 +136,47 @@ void handleMQTT() {
     }
 }
 
+
+// --- ОСНОВНЫЕ ФУНКЦИИ ---
 void setup() {
     Serial.begin(115200);
     delay(2000);
-
     Serial.println("=== ESP32 Starting ===");
-    Serial.printf("Flash size: %d MB\n", ESP.getFlashChipSize() / (1024 * 1024));
-    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-
-    // Always start in configuration mode since we have empty credentials
-    Serial.println("[MAIN] Starting in configuration mode...");
     startAPMode();
 }
 
 void loop() {
-    delay(100); // Prevent watchdog reset
+    delay(100); 
     yield();
 
     if (configMode) {
-        // Handle web configuration
         dnsServer.processNextRequest();
         server.handleClient();
-
-        // Show status every 30 seconds
+        
         static unsigned long lastStatus = 0;
         if (millis() - lastStatus > 30000) {
             lastStatus = millis();
-            Serial.println("[WEB] Waiting for configuration... Connect to: " + String(ap_ssid));
+            // ⭐️ ИЗМЕНЕНО: Используем глобальную переменную deviceName
+            Serial.println("[WEB] Waiting for configuration... Connect to: " + deviceName);
         }
 
     } else {
-        // Normal operation mode
-
-        // Check WiFi connection
         auth.loop_wifi();
-
         if (auth.is_connected()) {
-            // Handle MQTT
             mqtt.receive_message();
 
-            // Handle credential updates from MQTT
             if (wifiCredentialsUpdated) {
                 wifiCredentialsUpdated = false;
                 Serial.println("[MAIN] Credentials updated via MQTT, reconnecting...");
                 connectToWiFi();
             }
 
-            // Your main application code here
             static unsigned long lastMessage = 0;
             if (millis() - lastMessage > 10000) {
                 lastMessage = millis();
                 mqtt.send_message("Hello from ESP32!");
                 Serial.println("[MAIN] Sent test message");
             }
-
         } else {
             Serial.println("[MAIN] WiFi connection lost. Starting AP mode...");
             startAPMode();
