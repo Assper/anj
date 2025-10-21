@@ -1,185 +1,475 @@
-#include "../../../lib/MQTT/src/mqtt.hpp"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <DNSServer.h>
+#include <EEPROM.h>
 #include <ArduinoJson.h>
-#include <esp_mac.h> // Явно подключим для esp_read_mac
-#include "../../shared/auth.hpp"
 
-// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+#define EEPROM_SIZE 512
+
 WebServer server(80);
-DNSServer dnsServer;
-const char* ap_password = "12345678"; // Пароль к точке доступа
-String deviceName = ""; // Будем хранить уникальное имя устройства здесь
 
-// --- Экземпляры твоих классов ---
-Auth auth("", ""); 
-MQTT mqtt;
-bool wifiCredentialsUpdated = false;
-bool configMode = true;
+// Статус подключения
+enum DeviceStatus {
+  STATUS_AP_MODE,
+  STATUS_CONNECTING,
+  STATUS_CONNECTED,
+  STATUS_FAILED
+};
 
-// --- ОБЪЯВЛЕНИЕ ФУНКЦИЙ ---
-void startAPMode();
-void connectToWiFi();
-void handleCaptivePortal(); // ИЗМЕНЕНО: Новая функция для редиректа
-void handleStatus();
-void handleMQTT();
-// handleRoot и handleSave удалены
+DeviceStatus currentStatus = STATUS_AP_MODE;
+String lastError = "";
+unsigned long lastConnectionAttempt = 0;
+unsigned long lastStatusCheck = 0;
 
-// --- РЕАЛИЗАЦИЯ ФУНКЦИЙ ---
+// ===================================================================
+// === Функции для работы с EEPROM ===
+// ===================================================================
 
-// Генерирует уникальное имя на основе MAC-адреса
-String generateDeviceName() {
-    uint8_t mac[6];
-    char macStr[18] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(macStr, sizeof(macStr), "%02X%02X%02X", mac[3], mac[4], mac[5]);
-    return "Hub-Device-" + String(macStr);
+void saveCredentials(const String& ssid, const String& password) {
+  EEPROM.begin(EEPROM_SIZE);
+  // Clear EEPROM
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0);
+  }
+  // Write SSID
+  for (int i = 0; i < ssid.length(); i++) {
+    EEPROM.write(i, ssid[i]);
+  }
+  // Write Password starting at address 100
+  for (int i = 0; i < password.length(); i++) {
+    EEPROM.write(100 + i, password[i]);
+  }
+  EEPROM.commit();
+  EEPROM.end();
 }
 
-void connectToWiFi() {
-    Serial.println("[MAIN] Attempting WiFi connection...");
-
-    if (configMode) {
-        server.stop();
-        dnsServer.stop();
-        WiFi.softAPdisconnect(true);
-        delay(1000);
-    }
-
-    auth.connect_wifi();
-
-    if (auth.is_connected()) {
-        Serial.println("[MAIN] WiFi connected! Starting normal operation...");
-        configMode = false;
-        mqtt.setAuthInstance(&auth);
-        mqtt.connect();
-    } else {
-        Serial.println("[MAIN] WiFi connection failed. Returning to AP mode...");
-        delay(2000);
-        startAPMode();
-    }
+String readSSID() {
+  EEPROM.begin(EEPROM_SIZE);
+  String ssid = "";
+  for (int i = 0; i < 100; i++) {
+    char c = EEPROM.read(i);
+    if (c == 0) break;
+    ssid += c;
+  }
+  EEPROM.end();
+  return ssid;
 }
 
-// ⭐️ ИЗМЕНЕНО: Эта функция теперь отвечает за редирект в приложение
-void handleCaptivePortal() {
-    // Формируем специальную ссылку (deep link) для твоего приложения
-    String redirectUrl = "anj-iot://configure?device_name=" + deviceName;
+String readPassword() {
+  EEPROM.begin(EEPROM_SIZE);
+  String password = "";
+  for (int i = 100; i < 200; i++) {
+    char c = EEPROM.read(i);
+    if (c == 0) break;
+    password += c;
+  }
+  EEPROM.end();
+  return password;
+}
+
+// ===================================================================
+// === Обработчики веб-сервера ===
+// ===================================================================
+
+// Добавляем CORS заголовки для всех ответов
+void setCORSHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void handleOptions() {
+  setCORSHeaders();
+  server.send(204);
+}
+
+void handleConfigure() {
+  setCORSHeaders();
+  
+  if (server.hasArg("plain") == false) {
+    server.send(400, "text/plain", "Body not received");
+    return;
+  }
+  
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, body);
+
+  String ssid = doc["ssid"];
+  String password = doc["password"];
+
+  if (ssid.length() > 0 && password.length() > 0) {
+    saveCredentials(ssid, password);
     
-    // Отправляем HTTP-ответ 302, который говорит браузеру перейти по новой ссылке
-    server.sendHeader("Location", redirectUrl, true);
-    server.send(302, "text/plain", ""); // Тело ответа может быть пустым
-    Serial.println("[WEB] Captive Portal: Redirecting to mobile app via " + redirectUrl);
+    DynamicJsonDocument response(256);
+    response["status"] = "success";
+    response["message"] = "Credentials saved. Device will restart.";
+    
+    String jsonResponse;
+    serializeJson(response, jsonResponse);
+    
+    server.send(200, "application/json", jsonResponse);
+    delay(1000);
+    ESP.restart();
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid credentials\"}");
+  }
 }
 
+// НОВИЙ HANDLER - зміна WiFi кредів без reset
+void handleReconfigure() {
+  setCORSHeaders();
+  
+  if (server.hasArg("plain") == false) {
+    server.send(400, "text/plain", "Body not received");
+    return;
+  }
+  
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, body);
+
+  String ssid = doc["ssid"];
+  String password = doc["password"];
+
+  if (ssid.length() > 0 && password.length() > 0) {
+    saveCredentials(ssid, password);
+    
+    DynamicJsonDocument response(256);
+    response["status"] = "success";
+    response["message"] = "New credentials saved. Reconnecting...";
+    
+    String jsonResponse;
+    serializeJson(response, jsonResponse);
+    
+    server.send(200, "application/json", jsonResponse);
+    
+    delay(500);
+    // Відключаємось та підключаємось з новими кредами
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    currentStatus = STATUS_CONNECTING;
+    lastConnectionAttempt = millis();
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid credentials\"}");
+  }
+}
+
+void handleRoot() {
+  setCORSHeaders();
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>ESP32 Config</title>";
+  html += "<style>body{font-family:Arial;margin:20px;} input{width:100%;padding:10px;margin:5px 0;} button{width:100%;padding:15px;background:#4CAF50;color:white;border:none;cursor:pointer;}</style>";
+  html += "</head><body>";
+  html += "<h1>ESP32 WiFi Config</h1>";
+  html += "<p>Status: Configuration Mode</p>";
+  html += "<form id='wifiForm'>";
+  html += "<input type='text' id='ssid' placeholder='WiFi SSID' required><br>";
+  html += "<input type='password' id='password' placeholder='WiFi Password' required><br>";
+  html += "<button type='submit'>Connect</button>";
+  html += "</form>";
+  html += "<div id='result'></div>";
+  html += "<script>";
+  html += "document.getElementById('wifiForm').addEventListener('submit', function(e) {";
+  html += "  e.preventDefault();";
+  html += "  var ssid = document.getElementById('ssid').value;";
+  html += "  var password = document.getElementById('password').value;";
+  html += "  fetch('/configure-wifi', {";
+  html += "    method: 'POST',";
+  html += "    headers: {'Content-Type': 'application/json'},";
+  html += "    body: JSON.stringify({ssid: ssid, password: password})";
+  html += "  }).then(r => r.json()).then(d => {";
+  html += "    document.getElementById('result').innerHTML = '<p style=\"color:green\">' + d.message + '</p>';";
+  html += "  }).catch(e => {";
+  html += "    document.getElementById('result').innerHTML = '<p style=\"color:red\">Error: ' + e + '</p>';";
+  html += "  });";
+  html += "});";
+  html += "</script>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+// Обработчик статуса - работает в обоих режимах
+void handleStatus() {
+  setCORSHeaders();
+  
+  DynamicJsonDocument doc(512);
+  
+  switch(currentStatus) {
+    case STATUS_AP_MODE:
+      doc["status"] = "ap_mode";
+      doc["message"] = "Device in configuration mode";
+      doc["ip"] = WiFi.softAPIP().toString();
+      doc["ssid"] = "Hub-device-config";
+      doc["mode"] = "AP";
+      break;
+      
+    case STATUS_CONNECTING:
+      doc["status"] = "connecting";
+      doc["message"] = "Attempting to connect to WiFi";
+      doc["ssid"] = readSSID();
+      doc["attempt_time"] = millis() - lastConnectionAttempt;
+      doc["mode"] = "STA";
+      break;
+      
+    case STATUS_CONNECTED:
+      doc["status"] = "connected";
+      doc["message"] = "Connected to WiFi";
+      doc["ip"] = WiFi.localIP().toString();
+      doc["ssid"] = WiFi.SSID();
+      doc["rssi"] = WiFi.RSSI();
+      doc["mode"] = "STA";
+      break;
+      
+    case STATUS_FAILED:
+      doc["status"] = "failed";
+      doc["message"] = "Failed to connect";
+      doc["error"] = lastError;
+      doc["ssid"] = readSSID();
+      doc["mode"] = "AP";
+      break;
+  }
+  
+  doc["uptime"] = millis() / 1000;
+  doc["free_heap"] = ESP.getFreeHeap();
+  
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+// ⭐️ ПОКРАЩЕНИЙ - Обработчик пинга з більш детальною інформацією
+void handlePing() {
+  setCORSHeaders();
+  
+  DynamicJsonDocument doc(384);
+  doc["status"] = "ok";
+  doc["uptime"] = millis() / 1000;
+  doc["free_heap"] = ESP.getFreeHeap();
+  
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+  doc["connected"] = isConnected;
+  
+  if (isConnected) {
+    doc["ip"] = WiFi.localIP().toString();
+    doc["mode"] = "STA";
+    doc["ssid"] = WiFi.SSID();
+    doc["rssi"] = WiFi.RSSI();
+    doc["gateway"] = WiFi.gatewayIP().toString();
+  } else {
+    doc["ip"] = WiFi.softAPIP().toString();
+    doc["mode"] = "AP";
+    doc["ssid"] = "Hub-device-config";
+  }
+  
+  // Додаємо MAC адрес
+  doc["mac"] = WiFi.macAddress();
+  
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+// Сброс настроек
+void handleReset() {
+  setCORSHeaders();
+  
+  EEPROM.begin(EEPROM_SIZE);
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0);
+  }
+  EEPROM.commit();
+  EEPROM.end();
+  
+  server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Credentials cleared. Restarting...\"}");
+  delay(1000);
+  ESP.restart();
+}
+
+// ===================================================================
+// === Функции запуска режимов ===
+// ===================================================================
 
 void startAPMode() {
-    Serial.println("[WEB] Starting Access Point mode...");
-    
-    // ⭐️ ИЗМЕНЕНО: Генерируем имя один раз и сохраняем в глобальную переменную
-    deviceName = generateDeviceName();
+  Serial.println("Starting AP Mode...");
+  currentStatus = STATUS_AP_MODE;
+  
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  
+  // Генеруємо унікальний IP базуючись на MAC адресі
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  
+  // Генеруємо IP в діапазоні 192.168.100.X - 192.168.100.255
+  uint8_t lastOctet = mac[5];
+  if (lastOctet < 2) lastOctet = 2; // Уникаємо .0 та .1
+  
+  IPAddress localIP(192, 168, 100, lastOctet);
+  IPAddress gateway(192, 168, 100, lastOctet);
+  IPAddress subnet(255, 255, 255, 0);
+  
+  Serial.print("Device MAC: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%02X", mac[i]);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
+  
+  Serial.print("Generated unique IP: 192.168.100.");
+  Serial.println(lastOctet);
+  
+  WiFi.softAPConfig(localIP, gateway, subnet);
+  WiFi.softAP("Hub-device-config", "password");
+  
+  delay(500);
+  
+  IPAddress IP = WiFi.softAPIP();
+  
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+  Serial.println("Connect to 'Hub-device-config' WiFi network");
+  Serial.println("Password: password");
 
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(deviceName.c_str(), ap_password); // Используем .c_str() для String
-
-    Serial.println("[WEB] Access Point started:");
-    Serial.println("Network: " + deviceName);
-    Serial.println("Password: " + String(ap_password));
-    Serial.println("IP: " + WiFi.softAPIP().toString());
-    
-    dnsServer.start(53, "*", WiFi.softAPIP());
-
-    // ⭐️ ИЗМЕНЕНО: Настраиваем сервер на редирект
-    server.on("/", handleCaptivePortal);            // При заходе на главную страницу
-    server.on("/status", handleStatus);             // Оставим для отладки
-    server.on("/mqtt", HTTP_POST, handleMQTT);      // Оставим для отладки
-    server.onNotFound(handleCaptivePortal);         // Для всех остальных запросов (это ключ к работе Captive Portal)
-    // server.on("/save", ...) удален
-
-    server.begin();
-    Serial.println("[WEB] Web server started");
-
-    configMode = true;
+  // Регистрируем все обработчики
+  server.on("/", handleRoot);
+  server.on("/configure-wifi", HTTP_POST, handleConfigure);
+  server.on("/configure-wifi", HTTP_OPTIONS, handleOptions);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/status", HTTP_OPTIONS, handleOptions);
+  server.on("/ping", HTTP_GET, handlePing);
+  server.on("/ping", HTTP_OPTIONS, handleOptions);
+  server.on("/reset", HTTP_POST, handleReset);
+  server.on("/reset", HTTP_OPTIONS, handleOptions);
+  
+  server.begin();
+  Serial.println("HTTP server started in AP mode");
 }
 
-// ⭐️ УДАЛЕНО: handleRoot() и config_html больше не нужны
-// ⭐️ УДАЛЕНО: handleSave() больше не нужен
+void startSTAMode() {
+  Serial.println("");
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Gateway: ");
+  Serial.println(WiFi.gatewayIP());
+  Serial.print("Subnet: ");
+  Serial.println(WiFi.subnetMask());
+  Serial.print("RSSI: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+  
+  currentStatus = STATUS_CONNECTED;
 
-void handleStatus() {
-    DynamicJsonDocument doc(256);
-    doc["wifi_connected"] = auth.is_connected();
-    doc["config_mode"] = configMode;
-    doc["ip_address"] = WiFi.localIP().toString();
-
-    String output;
-    serializeJson(doc, output);
-    server.send(200, "application/json", output);
+  // В режиме клиента регистрируем обработчики
+  server.on("/ping", HTTP_GET, handlePing);
+  server.on("/ping", HTTP_OPTIONS, handleOptions);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/status", HTTP_OPTIONS, handleOptions);
+  server.on("/reconfigure-wifi", HTTP_POST, handleReconfigure);
+  server.on("/reconfigure-wifi", HTTP_OPTIONS, handleOptions);
+  server.on("/reset", HTTP_POST, handleReset);
+  server.on("/reset", HTTP_OPTIONS, handleOptions);
+  
+  server.begin();
+  Serial.println("HTTP server started in STA mode");
 }
 
-void handleMQTT() {
-    if (server.hasArg("plain") == false) {
-        server.send(400, "text/plain", "Body not received");
-        return;
-    }
-    String body = server.arg("plain");
-    server.send(200, "text/plain", "Message received");
-    
-    DynamicJsonDocument doc(256);
-    if (deserializeJson(doc, body)) return;
+// ===================================================================
+// === Setup и Loop ===
+// ===================================================================
 
-    String topic = doc["topic"];
-    String mqttMessage = doc["message"];
-
-    if (topic == "esp32/test") {
-        mqtt.send_message(mqttMessage.c_str());
-    }
-}
-
-
-// --- ОСНОВНЫЕ ФУНКЦИИ ---
 void setup() {
-    Serial.begin(115200);
-    delay(2000);
-    Serial.println("=== ESP32 Starting ===");
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n=================================");
+  Serial.println("ESP32 WiFi Configuration v1.0");
+  Serial.println("=================================\n");
+
+  String ssid = readSSID();
+  String password = readPassword();
+
+  if (ssid.length() > 0) {
+    // Есть сохраненные credentials - пытаемся подключиться
+    Serial.println("Found saved credentials:");
+    Serial.print("SSID: ");
+    Serial.println(ssid);
+    Serial.println("Attempting to connect...");
+    
+    currentStatus = STATUS_CONNECTING;
+    lastConnectionAttempt = millis();
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      // Успешно подключились
+      Serial.println("");
+      startSTAMode();
+    } else {
+      // Не удалось подключиться - переходим в режим AP
+      Serial.println("\nFailed to connect to saved WiFi.");
+      Serial.println("Starting configuration server...");
+      currentStatus = STATUS_FAILED;
+      lastError = "Connection timeout - check SSID/password";
+      startAPMode();
+    }
+  } else {
+    // Нет сохраненных credentials - запускаем режим AP
+    Serial.println("No saved WiFi credentials found.");
+    Serial.println("Starting configuration mode...");
     startAPMode();
+  }
+  
+  Serial.println("\nSetup complete!");
+  Serial.println("=================================\n");
 }
 
 void loop() {
-    delay(100); 
-    yield();
-
-    if (configMode) {
-        dnsServer.processNextRequest();
-        server.handleClient();
-        
-        static unsigned long lastStatus = 0;
-        if (millis() - lastStatus > 30000) {
-            lastStatus = millis();
-            // ⭐️ ИЗМЕНЕНО: Используем глобальную переменную deviceName
-            Serial.println("[WEB] Waiting for configuration... Connect to: " + deviceName);
-        }
-
-    } else {
-        auth.loop_wifi();
-        if (auth.is_connected()) {
-            mqtt.receive_message();
-
-            if (wifiCredentialsUpdated) {
-                wifiCredentialsUpdated = false;
-                Serial.println("[MAIN] Credentials updated via MQTT, reconnecting...");
-                connectToWiFi();
-            }
-
-            static unsigned long lastMessage = 0;
-            if (millis() - lastMessage > 10000) {
-                lastMessage = millis();
-                mqtt.send_message("Hello from ESP32!");
-                Serial.println("[MAIN] Sent test message");
-            }
-        } else {
-            Serial.println("[MAIN] WiFi connection lost. Starting AP mode...");
-            startAPMode();
-        }
+  server.handleClient();
+  
+  // Мониторинг підключення - перевірка кожні 5 секунд
+  if (millis() - lastStatusCheck > 5000) {
+    lastStatusCheck = millis();
+    
+    if (currentStatus == STATUS_CONNECTED && WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected! Attempting to reconnect...");
+      currentStatus = STATUS_CONNECTING;
+      lastConnectionAttempt = millis();
+      WiFi.reconnect();
     }
+  }
+  
+  // Автоматическое переподключение
+  if (currentStatus == STATUS_CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      currentStatus = STATUS_CONNECTED;
+      Serial.println("Reconnected successfully!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      
+      // Перезапускаємо server після реконекту
+      server.begin();
+    } else if (millis() - lastConnectionAttempt > 30000) {
+      // Если не удалось подключиться за 30 секунд
+      currentStatus = STATUS_FAILED;
+      lastError = "Reconnection timeout";
+      Serial.println("Reconnection failed. Switching to AP mode...");
+      startAPMode();
+    }
+  }
+  
+  delay(10);
 }
